@@ -11,7 +11,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/Dieterbe/statsd-go"
 	"github.com/graphite-ng/carbon-relay-ng/admin"
-	"github.com/graphite-ng/carbon-relay-ng/routing"
+	"routing"
 	"github.com/rcrowley/goagain"
 	"html/template"
 	"io"

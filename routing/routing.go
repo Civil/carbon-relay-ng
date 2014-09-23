@@ -10,6 +10,9 @@ import (
 	"regexp"
 	"sync"
 	"time"
+	"strings"
+	"bytes"
+	"hash/crc32"
 )
 
 type Route struct {
@@ -29,7 +32,7 @@ type Route struct {
 	shutdown     chan bool         // signals shutdown internally
 	queue        *nsqd.DiskQueue   // queue used if spooling enabled
 	raddr        *net.TCPAddr      // resolved remote addr
-	connUpdates  chan *net.TCPConn // when the route connects to a new endpoint (possibly nil)
+	connUpdates  chan []*net.TCPConn // when the route connects to a new endpoint (possibly nil)
 	inConnUpdate chan bool         // to signal when we start a new conn and when we finish
 }
 
@@ -42,6 +45,11 @@ func NewRoute(key, patt, addr, spoolDir string, spool bool, instrument *statsd.C
 		spoolDir:   spoolDir,
 		Spool:      spool,
 		instrument: instrument,
+	}
+	if patt == "" {
+		route.Patt = ""
+		route.Reg = nil
+		return route, nil
 	}
 	err := route.updatePattern(patt)
 	if err != nil {
@@ -64,6 +72,11 @@ func (route *Route) Copy() *Route {
 }
 
 func (route *Route) updatePattern(pattern string) error {
+	if pattern == "" {
+		route.Patt = ""
+		route.Reg = nil
+		return nil
+	}
 	regex, err := regexp.Compile(pattern)
 	if err != nil {
 		return err
@@ -76,7 +89,7 @@ func (route *Route) updatePattern(pattern string) error {
 func (route *Route) Run() (err error) {
 	route.ch = make(chan []byte)
 	route.shutdown = make(chan bool)
-	route.connUpdates = make(chan *net.TCPConn)
+	route.connUpdates = make(chan []*net.TCPConn)
 	route.inConnUpdate = make(chan bool)
 	if route.Spool {
 		dqName := "spool_" + route.Key
@@ -94,28 +107,34 @@ func (route *Route) Shutdown() error {
 	return nil
 }
 
-func (route *Route) updateConn(addr string) error {
-	log.Printf("%v (re)connecting to %v\n", route.Key, addr)
+func (route *Route) updateConn(addrs string) error {
+	log.Printf("%v (re)connecting to %v\n", route.Key, addrs)
 	route.inConnUpdate <- true
 	defer func() { route.inConnUpdate <- false }()
-	raddr, err := net.ResolveTCPAddr("tcp", addr)
-	if nil != err {
-		log.Printf("%v resolve failed: %s\n", route.Key, err.Error())
-		return err
+	addrs_list := strings.Split(addrs, ",")
+	new_conns := make([]*net.TCPConn, len(addrs_list))
+	i := 0
+	for _, addr := range addrs_list {
+		raddr, err := net.ResolveTCPAddr("tcp", addr)
+		if nil != err {
+			log.Printf("%v resolve failed: %s\n", route.Key, err.Error())
+			return err
+		}
+		laddr, _ := net.ResolveTCPAddr("tcp", "0.0.0.0")
+		new_conn, err := net.DialTCP("tcp", laddr, raddr)
+		if nil != err {
+			log.Printf("%v connect failed: %s\n", route.Key, err.Error())
+			return err
+		}
+		log.Printf("%v connected to %s\n", route.Key, addr)
+		new_conns[i] = new_conn
+		i++
 	}
-	laddr, _ := net.ResolveTCPAddr("tcp", "0.0.0.0")
-	new_conn, err := net.DialTCP("tcp", laddr, raddr)
-	if nil != err {
-		log.Printf("%v connect failed: %s\n", route.Key, err.Error())
-		return err
+	if addrs != route.Addr {
+		log.Printf("%v update address to %v (%v)\n", route.Key, addrs, route.Addr)
+		route.Addr = addrs
 	}
-	log.Printf("%v connected\n", route.Key)
-	if addr != route.Addr {
-		log.Printf("%v update address to %v (%v)\n", route.Key, addr, raddr)
-		route.Addr = addr
-		route.raddr = raddr
-	}
-	route.connUpdates <- new_conn
+	route.connUpdates <- new_conns
 	return nil
 }
 
@@ -125,10 +144,12 @@ func (route *Route) relay() {
 	period_assure_conn := time.Duration(60) * time.Second
 	ticker := time.NewTicker(period_assure_conn)
 	var to_unspool chan []byte
+	var conns []*net.TCPConn
+	var conns_len uint32
 	var conn *net.TCPConn
 
 	process_packet := func(buf []byte) {
-		if conn == nil {
+		if conns == nil {
 			if route.Spool {
 				route.instrument.Increment("route=" + route.Key + ".target_type=count.unit=Metric.direction=spool")
 				route.queue.Put(buf)
@@ -138,7 +159,16 @@ func (route *Route) relay() {
 			}
 			return
 		}
-		route.instrument.Increment("route=" + route.Key + ".target_type=count.unit=Metric.direction=out")
+		n := bytes.IndexAny(buf, " ")
+		if (conns_len == 1) {
+			conn = conns[0]
+		} else if n != -1 {
+			conn = conns[crc32.ChecksumIEEE(buf[:n]) % conns_len]
+			route.instrument.Increment("route=" + route.Key + ".target_type=count.unit=Metric.direction=out")
+		} else {
+			log.Println("Malformed input detected, refusing to process packet: %s", string(buf))
+			return
+		}
 		n, err := conn.Write(buf)
 		if nil != err {
 			route.instrument.Increment("route=" + route.Key + ".target_type=count.unit=Err")
@@ -168,7 +198,7 @@ func (route *Route) relay() {
 
 	for {
 		// only process spool queue if we have an outbound connection
-		if conn != nil && route.Spool {
+		if conns != nil && route.Spool {
 			to_unspool = route.queue.ReadChan()
 		} else {
 			to_unspool = nil
@@ -181,10 +211,11 @@ func (route *Route) relay() {
 			} else {
 				conn_updates -= 1
 			}
-		case new_conn := <-route.connUpdates:
-			conn = new_conn // can be nil and that's ok (it means we had to [re]connect but couldn't)
+		case new_conns := <-route.connUpdates:
+			conns = new_conns // can be nil and that's ok (it means we had to [re]connect but couldn't)
+			conns_len = uint32(len(conns))
 		case <-ticker.C: // periodically try to bring connection (back) up, if we have to, and no other connect is happening
-			if conn == nil && conn_updates == 0 {
+			if conns == nil && conn_updates == 0 {
 				go route.updateConn(route.Addr)
 			}
 		case <-route.shutdown:
@@ -233,7 +264,7 @@ func (routes *Routes) Dispatch(buf []byte, first_only bool) (routed bool) {
 	routes.lock.Lock()
 	defer routes.lock.Unlock()
 	for _, route := range routes.Map {
-		if route.Reg.Match(buf) {
+		if route.Reg == nil || route.Reg.Match(buf) {
 			routed = true
 			//fmt.Println("routing to " + route.Key)
 			route.ch <- buf
